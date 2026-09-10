@@ -241,6 +241,22 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 
 type NewAPIErrorOptions func(*NewAPIError)
 
+// defaultErrorStatusCodes overrides the 500 fallback for error codes that
+// describe a bad request rather than a server fault. A conversion failure means
+// the client shaped a request the target protocol cannot express; answering 500
+// makes clients treat it as a transient server fault and retry the same
+// impossible request, paying pre-consume and refund on every attempt.
+var defaultErrorStatusCodes = map[ErrorCode]int{
+	ErrorCodeConvertRequestFailed: http.StatusBadRequest,
+}
+
+func defaultErrorStatusCode(errorCode ErrorCode) int {
+	if statusCode, ok := defaultErrorStatusCodes[errorCode]; ok {
+		return statusCode
+	}
+	return http.StatusInternalServerError
+}
+
 func NewError(err error, errorCode ErrorCode, ops ...NewAPIErrorOptions) *NewAPIError {
 	var newErr *NewAPIError
 	// 保留深层传递的 new err
@@ -254,7 +270,7 @@ func NewError(err error, errorCode ErrorCode, ops ...NewAPIErrorOptions) *NewAPI
 		Err:        err,
 		RelayError: nil,
 		errorType:  ErrorTypeNewAPIError,
-		StatusCode: http.StatusInternalServerError,
+		StatusCode: defaultErrorStatusCode(errorCode),
 		errorCode:  errorCode,
 	}
 	for _, op := range ops {

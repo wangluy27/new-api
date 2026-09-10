@@ -41,6 +41,66 @@ func TestChatCompletionsResponseToResponsesPreservesTextToolCallsAndUsage(t *tes
 	assert.Equal(t, `"{\"q\":\"x\"}"`, string(resp.Output[1].Arguments))
 }
 
+func TestChatCompletionsResponseToResponsesSplitsNamespacedToolNames(t *testing.T) {
+	// The request converter flattens a Responses namespace group into
+	// "namespace__tool" so chat completions can carry it; the client only
+	// recognises the call when both halves come back separated.
+	t.Run("non-streaming", func(t *testing.T) {
+		chat := &dto.OpenAITextResponse{
+			Id:    "chatcmpl_1",
+			Model: "gpt-test",
+			Choices: []dto.OpenAITextResponseChoice{
+				{
+					Message:      assistantMessageWithTool("", "call_1", "multi_agent_v1__close_agent", `{"target":"a1"}`),
+					FinishReason: "tool_calls",
+				},
+			},
+		}
+
+		resp, _, err := ChatCompletionsResponseToResponsesResponse(chat, "resp_1")
+		require.NoError(t, err)
+		require.Len(t, resp.Output, 1)
+		assert.Equal(t, "close_agent", resp.Output[0].Name)
+		assert.Equal(t, "multi_agent_v1", resp.Output[0].Namespace)
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		state := NewChatToResponsesStreamState("resp_1", "gpt-test")
+		toolIndex := 0
+		events := mustResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+			Choices: []dto.ChatCompletionsStreamResponseChoice{
+				{Index: 0, Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{
+					{Index: &toolIndex, ID: "call_1", Type: "function", Function: dto.FunctionResponse{Name: "multi_agent_v1__close_agent"}},
+				}}},
+			},
+		})
+
+		added, found := lo.Find(events, func(event ChatToResponsesStreamEvent) bool {
+			return event.Type == responsesEventOutputItemAdded
+		})
+		require.True(t, found)
+		require.NotNil(t, added.Payload.Item)
+		assert.Equal(t, "close_agent", added.Payload.Item.Name)
+		assert.Equal(t, "multi_agent_v1", added.Payload.Item.Namespace)
+	})
+
+	t.Run("an unnamespaced tool keeps its whole name", func(t *testing.T) {
+		chat := &dto.OpenAITextResponse{
+			Id:    "chatcmpl_1",
+			Model: "gpt-test",
+			Choices: []dto.OpenAITextResponseChoice{
+				{Message: assistantMessageWithTool("", "call_1", "lookup", "{}"), FinishReason: "tool_calls"},
+			},
+		}
+
+		resp, _, err := ChatCompletionsResponseToResponsesResponse(chat, "resp_1")
+		require.NoError(t, err)
+		require.Len(t, resp.Output, 1)
+		assert.Equal(t, "lookup", resp.Output[0].Name)
+		assert.Empty(t, resp.Output[0].Namespace)
+	})
+}
+
 func TestChatCompletionsResponseToResponsesMapsIncompleteFinishReasons(t *testing.T) {
 	tests := []struct {
 		name         string
