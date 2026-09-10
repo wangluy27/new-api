@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	sharedresponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/responses"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
@@ -15,6 +16,14 @@ const (
 	responsesInputTypeFunctionCallOutput = "function_call_output"
 	responsesInputTypeCustomToolCall     = "custom_tool_call"
 	responsesInputTypeCustomToolOutput   = "custom_tool_call_output"
+
+	// ChatGPT wraps a group of function tools in these Responses tool types.
+	responsesToolTypeNamespace = "namespace"
+	responsesToolTypeMCPServer = "mcp_server"
+
+	// Cap on the dropped tool JSON echoed into the log; tool schemas can be tens
+	// of kilobytes and only the head identifies the shape.
+	droppedToolLogBytes = 2048
 )
 
 const (
@@ -280,6 +289,9 @@ func responsesFunctionCallItemToChatToolCall(item map[string]any) (dto.ToolCallR
 	if name == "" {
 		return dto.ToolCallRequest{}, errors.New("function_call item is missing name")
 	}
+	// The client replays the call it received, namespace and name split apart;
+	// the upstream only knows the flattened name it was offered.
+	name = sharedresponses.JoinNamespacedTool(strings.TrimSpace(kitutil.Interface2String(item["namespace"])), name)
 	return dto.ToolCallRequest{
 		ID:   responsesCallID(item),
 		Type: "function",
@@ -319,6 +331,16 @@ func appendToolCallToLastAssistant(messages []dto.Message, toolCall dto.ToolCall
 	return messages
 }
 
+// positionedTool pairs a Responses tool with the request path it came from, so
+// errors and logs can point at the exact entry the client sent. name is the
+// tool's effective chat completions name, which for a namespace member is
+// qualified with its namespace.
+type positionedTool struct {
+	position string
+	name     string
+	tool     map[string]any
+}
+
 func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, error) {
 	if !rawJSONPresent(raw) {
 		return nil, nil
@@ -329,29 +351,98 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
 		return nil, fmt.Errorf("invalid tools: %w", err)
 	}
 
-	out := make([]dto.ToolCallRequest, 0, len(tools))
-	for _, tool := range tools {
+	// ChatGPT groups related tools under a "namespace" tool. Chat completions has
+	// no grouping, so namespace members are lifted to the top level and keep their
+	// own names, which is what the model calls them by.
+	flattened := make([]positionedTool, 0, len(tools))
+	for i, tool := range tools {
+		position := fmt.Sprintf("tools[%d]", i)
+		name := strings.TrimSpace(kitutil.Interface2String(tool["name"]))
 		toolType := strings.TrimSpace(kitutil.Interface2String(tool["type"]))
-		if toolType == "function" {
+		if toolType != responsesToolTypeNamespace && toolType != responsesToolTypeMCPServer {
+			flattened = append(flattened, positionedTool{position: position, name: name, tool: tool})
+			continue
+		}
+		members, ok := tool["tools"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("%s declares tool type %q without a \"tools\" array", position, toolType)
+		}
+		for j, rawMember := range members {
+			member, ok := rawMember.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("%s.tools[%d] is not a tool object", position, j)
+			}
+			// Member names are unique only inside their namespace — two
+			// namespaces in the same request can both expose a "js" tool — so
+			// the namespace has to survive into the flat name and be split back
+			// out when the model calls the tool.
+			memberName := strings.TrimSpace(kitutil.Interface2String(member["name"]))
+			flattened = append(flattened, positionedTool{
+				position: fmt.Sprintf("%s.tools[%d]", position, j),
+				name:     sharedresponses.JoinNamespacedTool(name, memberName),
+				tool:     member,
+			})
+		}
+	}
+
+	out := make([]dto.ToolCallRequest, 0, len(flattened))
+	declaredAt := make(map[string]string, len(flattened))
+	for _, entry := range flattened {
+		toolType := strings.TrimSpace(kitutil.Interface2String(entry.tool["type"]))
+		switch toolType {
+		case "function":
 			out = append(out, dto.ToolCallRequest{
 				Type: "function",
 				Function: dto.FunctionRequest{
-					Name:        strings.TrimSpace(kitutil.Interface2String(tool["name"])),
-					Description: kitutil.Interface2String(tool["description"]),
-					Parameters:  tool["parameters"],
+					Name:        entry.name,
+					Description: kitutil.Interface2String(entry.tool["description"]),
+					Parameters:  entry.tool["parameters"],
 				},
 			})
+		case dto.CustomType:
+			// Chat completions keeps the discriminator in the outer "type" and
+			// nests the rest of the custom tool under "custom".
+			payload := make(map[string]any, len(entry.tool))
+			for key, value := range entry.tool {
+				if key != "type" {
+					payload[key] = value
+				}
+			}
+			if entry.name != "" {
+				payload["name"] = entry.name
+			}
+			rawTool, err := kitutil.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, dto.ToolCallRequest{
+				Type:   dto.CustomType,
+				Custom: rawTool,
+			})
+		default:
+			// Hosted Responses tools (web_search, file_search, code_interpreter,
+			// ...) run on the provider side and have no chat completions
+			// representation. Forwarding them makes the upstream reject the whole
+			// request, and failing here would too: ChatGPT attaches web_search to
+			// every request, so the client would never get a single answer
+			// through. Drop the capability, keep the request, and log what was
+			// lost so the gap is visible.
+			if rawTool, err := kitutil.Marshal(entry.tool); err == nil {
+				if len(rawTool) > droppedToolLogBytes {
+					rawTool = rawTool[:droppedToolLogBytes]
+				}
+				kitutil.LogError(fmt.Sprintf("responses to chat conversion dropped unsupported tool type %q at %s: %s", toolType, entry.position, strings.ToValidUTF8(string(rawTool), "")))
+			}
 			continue
 		}
 
-		rawTool, err := kitutil.Marshal(tool)
-		if err != nil {
-			return nil, err
+		// Namespace qualification keeps members apart, but a top-level tool can
+		// still claim the same name, and chat completions has no way to tell
+		// them apart.
+		if previous, exists := declaredAt[entry.name]; exists {
+			return nil, fmt.Errorf("tool name %q at %s duplicates %s; chat completions requires unique tool names", entry.name, entry.position, previous)
 		}
-		out = append(out, dto.ToolCallRequest{
-			Type:   toolType,
-			Custom: rawTool,
-		})
+		declaredAt[entry.name] = entry.position
 	}
 	return out, nil
 }
@@ -426,7 +517,16 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 
 func responsesImagePartToChatImageURL(part map[string]any) any {
 	if imageURL, ok := part["image_url"]; ok {
-		return imageURL
+		if object, isObject := imageURL.(map[string]any); isObject {
+			return object
+		}
+		// Responses allows image_url to be the bare URL string (a data: URI, for
+		// instance); chat completions only accepts the object form.
+		wrapped := map[string]any{"url": imageURL}
+		if detail, hasDetail := part["detail"]; hasDetail {
+			wrapped["detail"] = detail
+		}
+		return wrapped
 	}
 	imageURL := map[string]any{}
 	for _, key := range []string{"url", "file_id", "detail"} {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	sharedresponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/responses"
 )
 
 type ChatToResponsesStreamEvent struct {
@@ -209,6 +210,7 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 			tool.ID = fmt.Sprintf("%s_call_%d", s.ID, chatIndex)
 		}
 		s.toolsByIndex[chatIndex] = tool
+		namespace, name := sharedresponses.SplitNamespacedTool(tool.Name)
 		events = append(events, responsesStreamEvent(responsesEventOutputItemAdded, dto.ResponsesStreamResponse{
 			Type:        responsesEventOutputItemAdded,
 			OutputIndex: intPtr(tool.OutputIndex),
@@ -218,7 +220,8 @@ func (s *ChatToResponsesStreamState) appendToolCallDelta(toolCall dto.ToolCallRe
 				ID:        tool.ID,
 				Status:    "in_progress",
 				CallId:    tool.ID,
-				Name:      tool.Name,
+				Name:      name,
+				Namespace: namespace,
 				Arguments: []byte(`""`),
 			},
 		}))
@@ -406,12 +409,14 @@ func (s *ChatToResponsesStreamState) reasoningOutput(status string) *dto.Respons
 }
 
 func (s *ChatToResponsesStreamState) toolOutput(tool *chatToResponsesStreamTool, status string) *dto.ResponsesOutput {
+	namespace, name := sharedresponses.SplitNamespacedTool(tool.Name)
 	return &dto.ResponsesOutput{
 		Type:      responsesOutputTypeFunctionCall,
 		ID:        tool.ID,
 		Status:    status,
 		CallId:    tool.ID,
-		Name:      tool.Name,
+		Name:      name,
+		Namespace: namespace,
 		Arguments: chatArgumentsRawMessage(tool.Arguments.String()),
 	}
 }

@@ -120,6 +120,15 @@ func TestResponsesRequestToChatCompletionsRequestMultimodalInput(t *testing.T) {
 	assert.Equal(t, "wav", parts[3].GetInputAudio().Format)
 	assert.Equal(t, dto.ContentTypeVideoUrl, parts[4].Type)
 	assert.Equal(t, "https://example.test/v.mp4", parts[4].GetVideoUrl().Url)
+
+	// Responses allows a bare image_url string; chat completions only accepts the
+	// object form, so the body actually sent upstream has to carry it wrapped.
+	encoded, err := kitutil.Marshal(got.Messages[0])
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"url":"https://example.test/a.png","detail":"low"}`,
+		gjson.GetBytes(encoded, "content.1.image_url").Raw,
+	)
 }
 
 func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoexist(t *testing.T) {
@@ -293,6 +302,202 @@ func TestResponsesRequestToChatCompletionsRequestRejectsStatefulFields(t *testin
 			assert.Contains(t, err.Error(), "stateful fields")
 		})
 	}
+}
+
+func TestResponsesRequestToChatCompletionsRequestTools(t *testing.T) {
+	t.Run("function and custom tools keep their chat completions shape", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{
+					"type":        "function",
+					"name":        "memory_search",
+					"description": "search memory",
+					"parameters":  map[string]any{"type": "object"},
+				},
+				{
+					"type":   "custom",
+					"name":   "freeform",
+					"format": map[string]any{"type": "text"},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		encoded, err := kitutil.Marshal(got.Tools)
+		require.NoError(t, err)
+		assert.JSONEq(t, `[
+			{"type":"function","function":{"name":"memory_search","description":"search memory","parameters":{"type":"object"}}},
+			{"type":"custom","custom":{"name":"freeform","format":{"type":"text"}}}
+		]`, string(encoded))
+	})
+
+	t.Run("namespace members are lifted to the top level under qualified names", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{"type": "function", "name": "memory_search", "parameters": map[string]any{"type": "object"}},
+				{
+					"type":        "namespace",
+					"name":        "multi_agent_v1",
+					"description": "Tools for spawning and managing sub-agents.",
+					"tools": []map[string]any{
+						{"type": "function", "name": "close_agent", "description": "close", "parameters": map[string]any{"type": "object"}},
+						{"type": "function", "name": "resume_agent", "description": "resume", "parameters": map[string]any{"type": "object"}},
+					},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		encoded, err := kitutil.Marshal(got.Tools)
+		require.NoError(t, err)
+		assert.JSONEq(t, `[
+			{"type":"function","function":{"name":"memory_search","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"multi_agent_v1__close_agent","description":"close","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"multi_agent_v1__resume_agent","description":"resume","parameters":{"type":"object"}}}
+		]`, string(encoded))
+	})
+
+	t.Run("same member name in two namespaces stays distinguishable", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{
+					"type":  "namespace",
+					"name":  "container",
+					"tools": []map[string]any{{"type": "function", "name": "js", "parameters": map[string]any{"type": "object"}}},
+				},
+				{
+					"type":  "namespace",
+					"name":  "browser",
+					"tools": []map[string]any{{"type": "function", "name": "js", "parameters": map[string]any{"type": "object"}}},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got.Tools, 2)
+		assert.Equal(t, "container__js", got.Tools[0].Function.Name)
+		assert.Equal(t, "browser__js", got.Tools[1].Function.Name)
+	})
+
+	t.Run("mcp_server groups are flattened like namespaces", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{
+					"type":  "mcp_server",
+					"name":  "mcp__zai_vision",
+					"tools": []map[string]any{{"type": "function", "name": "analyze_image", "parameters": map[string]any{"type": "object"}}},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got.Tools, 1)
+		assert.Equal(t, "mcp__zai_vision__analyze_image", got.Tools[0].Function.Name)
+	})
+
+	t.Run("a replayed function_call is re-qualified with its namespace", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "user", "content": "hi"},
+				{
+					"type":      "function_call",
+					"call_id":   "call_1",
+					"name":      "close_agent",
+					"namespace": "multi_agent_v1",
+					"arguments": `{"target":"a1"}`,
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got.Messages, 2)
+		toolCalls := got.Messages[1].ParseToolCalls()
+		require.Len(t, toolCalls, 1)
+		assert.Equal(t, "multi_agent_v1__close_agent", toolCalls[0].Function.Name)
+	})
+
+	t.Run("a namespace member colliding with a top-level tool is reported", func(t *testing.T) {
+		_, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{"type": "function", "name": "multi_agent_v1__close_agent", "parameters": map[string]any{"type": "object"}},
+				{
+					"type": "namespace",
+					"name": "multi_agent_v1",
+					"tools": []map[string]any{
+						{"type": "function", "name": "close_agent", "parameters": map[string]any{"type": "object"}},
+					},
+				},
+			}),
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"multi_agent_v1__close_agent"`)
+		assert.Contains(t, err.Error(), "tools[1].tools[0]")
+		assert.Contains(t, err.Error(), "tools[0]")
+	})
+
+	for _, toolType := range []string{"web_search", "mcp", "image_generation"} {
+		t.Run("drops hosted tool "+toolType+" instead of failing the request", func(t *testing.T) {
+			// ChatGPT attaches web_search to every request; failing on it would
+			// make the whole channel unusable, so the capability is dropped and
+			// the rest of the request goes through.
+			got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+				Model: "deepseek-chat",
+				Input: mustRawMessage(t, "hi"),
+				Tools: mustRawMessage(t, []map[string]any{
+					{"type": "function", "name": "memory_search", "parameters": map[string]any{"type": "object"}},
+					{"type": toolType, "name": "hosted"},
+				}),
+			})
+			require.NoError(t, err)
+
+			require.Len(t, got.Tools, 1)
+			assert.Equal(t, "memory_search", got.Tools[0].Function.Name)
+		})
+	}
+
+	t.Run("drops a hosted tool nested inside a namespace", func(t *testing.T) {
+		got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{
+					"type": "namespace",
+					"name": "multi_agent_v1",
+					"tools": []map[string]any{
+						{"type": "web_search"},
+						{"type": "function", "name": "close_agent", "parameters": map[string]any{"type": "object"}},
+					},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got.Tools, 1)
+		assert.Equal(t, "multi_agent_v1__close_agent", got.Tools[0].Function.Name)
+	})
+
+	t.Run("still fails on a namespace without a tools array", func(t *testing.T) {
+		_, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+			Model: "deepseek-chat",
+			Input: mustRawMessage(t, "hi"),
+			Tools: mustRawMessage(t, []map[string]any{
+				{"type": "namespace", "name": "multi_agent_v1"},
+			}),
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tools[0]")
+	})
 }
 
 func mustRawMessage(t *testing.T, value any) []byte {
