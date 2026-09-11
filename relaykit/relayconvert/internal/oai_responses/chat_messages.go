@@ -55,7 +55,7 @@ func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Me
 			}
 			partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
 			if _, ok := chatContentPartTypes[partType]; ok {
-				supported = append(supported, rawPart)
+				supported = append(supported, normalizeChatContentPart(part))
 				continue
 			}
 			kitutil.LogError(fmt.Sprintf("responses to chat conversion dropped unsupported content part type %q at messages[%d].content[%d]", partType, i, j))
@@ -78,4 +78,31 @@ func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Me
 		kept = append(kept, message)
 	}
 	return kept, nil
+}
+
+// normalizeChatContentPart repairs part shapes that Responses allows and chat
+// completions does not.
+//
+// Responses accepts a bare URL string for image_url - Codex sends a pasted
+// screenshot that way, as a data: URI - while chat completions only takes the
+// object form. Sending the string makes the whole content array fail its union,
+// and the error that surfaces names the other branch:
+//
+//	[invalid_request_error] Input should be a valid string
+//
+// which points at content rather than at the part that caused it.
+func normalizeChatContentPart(part map[string]any) map[string]any {
+	if strings.TrimSpace(kitutil.Interface2String(part["type"])) != dto.ContentTypeImageURL {
+		return part
+	}
+	imageURL, isString := part[dto.ContentTypeImageURL].(string)
+	if !isString || imageURL == "" {
+		return part
+	}
+	repaired := make(map[string]any, len(part))
+	for key, value := range part {
+		repaired[key] = value
+	}
+	repaired[dto.ContentTypeImageURL] = map[string]any{"url": imageURL}
+	return repaired
 }

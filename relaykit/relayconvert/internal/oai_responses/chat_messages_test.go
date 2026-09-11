@@ -78,6 +78,52 @@ func TestChatMessagesFromResponsesRequest(t *testing.T) {
 		assert.Equal(t, "call_1", got[2].ToolCallId)
 	})
 
+	t.Run("a scalar image_url is wrapped into the object form", func(t *testing.T) {
+		// Codex pastes a screenshot as a bare data: URI, which Responses allows
+		// and chat completions does not. Sending the string fails the content
+		// union and the error that surfaces names the other branch - "Input
+		// should be a valid string" - pointing at content, not at the part.
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{
+					"role": "user",
+					"content": []map[string]any{
+						{"type": "input_text", "text": "what is in this image?"},
+						{"type": "input_image", "image_url": "data:image/jpeg;base64,AAAA"},
+					},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 1)
+		encoded, err := kitutil.Marshal(got[0].Content)
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), `"image_url":{"url":"data:image/jpeg;base64,AAAA"}`)
+	})
+
+	t.Run("an object image_url is left alone", func(t *testing.T) {
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{
+					"role": "user",
+					"content": []map[string]any{
+						{"type": "input_image", "image_url": map[string]any{"url": "https://example.test/a.png", "detail": "low"}},
+					},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 1)
+		encoded, err := kitutil.Marshal(got[0].Content)
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), `"detail":"low"`)
+		assert.Contains(t, string(encoded), `"url":"https://example.test/a.png"`)
+	})
+
 	t.Run("a message left with only tool calls sends a null content", func(t *testing.T) {
 		// Not an empty array: an upstream that accepts a string or null there
 		// answers "Input should be a valid string" for [].
