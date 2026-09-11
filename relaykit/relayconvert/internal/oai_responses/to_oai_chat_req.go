@@ -36,7 +36,7 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		return nil, err
 	}
 
-	messages, err := responsesRequestMessagesToChat(req)
+	messages, err := ChatMessagesFromResponsesRequest(req)
 	if err != nil {
 		return nil, err
 	}
