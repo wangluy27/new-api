@@ -1,0 +1,79 @@
+package oairesponses
+
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestChatMessagesFromResponsesRequest(t *testing.T) {
+	t.Run("a replayed reasoning item does not reach the upstream", func(t *testing.T) {
+		// Codex asks for reasoning.encrypted_content and replays the reasoning
+		// item on the next turn. It has no role, so it converts into a user
+		// message whose parts the upstream rejects outright:
+		//   messages[4]: unknown variant `reasoning_text`
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "user", "content": []map[string]any{{"type": "input_text", "text": "hi"}}},
+				{
+					"type":    "reasoning",
+					"id":      "rs_1",
+					"summary": []map[string]any{{"type": "summary_text", "text": "thinking"}},
+					"content": []map[string]any{{"type": "reasoning_text", "text": "private chain of thought"}},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 1)
+		assert.Equal(t, "user", got[0].Role)
+		assert.Equal(t, "hi", got[0].Content)
+	})
+
+	t.Run("unsupported parts are dropped without losing the rest of the message", func(t *testing.T) {
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{
+					"role": "user",
+					"content": []map[string]any{
+						{"type": "input_text", "text": "look at this"},
+						{"type": "reasoning_text", "text": "private chain of thought"},
+						{"type": "input_image", "image_url": "https://example.test/a.png"},
+					},
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 1)
+		parts := got[0].ParseContent()
+		require.Len(t, parts, 2)
+		assert.Equal(t, dto.ContentTypeText, parts[0].Type)
+		assert.Equal(t, dto.ContentTypeImageURL, parts[1].Type)
+	})
+
+	t.Run("an assistant message keeps its tool calls when it has no content", func(t *testing.T) {
+		// Dropping a message that has no parts left must not take a replayed
+		// tool call with it: the tool result that follows would then reference a
+		// call the upstream never saw.
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"type": "function_call", "call_id": "call_1", "name": "js", "arguments": "{}"},
+				{"type": "function_call_output", "call_id": "call_1", "output": "42"},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 3)
+		assert.Equal(t, "assistant", got[1].Role)
+		require.Len(t, got[1].ParseToolCalls(), 1)
+		assert.Equal(t, "tool", got[2].Role)
+		assert.Equal(t, "call_1", got[2].ToolCallId)
+	})
+}
