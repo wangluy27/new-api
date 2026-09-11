@@ -63,7 +63,15 @@ func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Me
 
 		// Tool calls are carried outside content, so a message can legitimately
 		// end up with no parts left and still be worth sending.
-		if len(supported) == 0 && len(message.ToolCalls) == 0 {
+		if len(supported) == 0 {
+			if len(message.ToolCalls) == 0 {
+				continue
+			}
+			// null, not an empty array: an assistant message that only carries
+			// tool calls has always been sent with a null content, and an
+			// upstream that accepts a string or null there rejects [].
+			message.Content = nil
+			kept = append(kept, message)
 			continue
 		}
 		message.Content = supported

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -75,5 +76,27 @@ func TestChatMessagesFromResponsesRequest(t *testing.T) {
 		require.Len(t, got[1].ParseToolCalls(), 1)
 		assert.Equal(t, "tool", got[2].Role)
 		assert.Equal(t, "call_1", got[2].ToolCallId)
+	})
+
+	t.Run("a message left with only tool calls sends a null content", func(t *testing.T) {
+		// Not an empty array: an upstream that accepts a string or null there
+		// answers "Input should be a valid string" for [].
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "assistant", "content": []map[string]any{{"type": "reasoning_text", "text": "private"}}},
+				{"type": "function_call", "call_id": "call_1", "name": "js", "arguments": "{}"},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 1)
+		assert.Equal(t, "assistant", got[0].Role)
+		assert.Nil(t, got[0].Content)
+		require.Len(t, got[0].ParseToolCalls(), 1)
+
+		encoded, err := kitutil.Marshal(got[0])
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), `"content":null`)
 	})
 }
