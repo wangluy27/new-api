@@ -78,6 +78,48 @@ func TestChatMessagesFromResponsesRequest(t *testing.T) {
 		assert.Equal(t, "call_1", got[2].ToolCallId)
 	})
 
+	t.Run("an automation trigger becomes a user message", func(t *testing.T) {
+		// ChatGPT opens an automation turn with a function_call_output that has
+		// no call_id and no preceding function_call. Left as a tool message it
+		// is refused: chat completions needs a tool_call_id and an assistant
+		// message with tool_calls before it.
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "user", "content": "run the automation"},
+				{
+					"type":      "function_call_output",
+					"id":        "fco_01a0a2c8",
+					"name":      "automation_update",
+					"namespace": "codex_app",
+					"output":    "Automation: check the structure. Automation ID: automation-3",
+				},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 2)
+		assert.Equal(t, "user", got[1].Role)
+		assert.Empty(t, got[1].ToolCallId)
+		assert.Contains(t, got[1].Content, "Automation ID: automation-3")
+	})
+
+	t.Run("a tool result that answers a real call stays a tool message", func(t *testing.T) {
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"role": "user", "content": "hi"},
+				{"type": "function_call", "call_id": "call_1", "name": "js", "arguments": "{}"},
+				{"type": "function_call_output", "call_id": "call_1", "output": "42"},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 3)
+		assert.Equal(t, "tool", got[2].Role)
+		assert.Equal(t, "call_1", got[2].ToolCallId)
+	})
+
 	t.Run("a scalar image_url is wrapped into the object form", func(t *testing.T) {
 		// Codex pastes a screenshot as a bare data: URI, which Responses allows
 		// and chat completions does not. Sending the string fails the content

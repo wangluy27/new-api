@@ -37,8 +37,21 @@ func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Me
 		return nil, err
 	}
 
+	// A tool result is only valid next to the call it answers. Collecting the
+	// ids first lets the loop below tell a real result from one the client
+	// injected on its own.
+	answeredCalls := make(map[string]struct{})
+	for _, message := range messages {
+		for _, toolCall := range message.ParseToolCalls() {
+			if toolCall.ID != "" {
+				answeredCalls[toolCall.ID] = struct{}{}
+			}
+		}
+	}
+
 	kept := make([]dto.Message, 0, len(messages))
 	for i, message := range messages {
+		message = adoptOrphanToolResult(message, answeredCalls, i)
 		parts, ok := message.Content.([]any)
 		if !ok {
 			// A string content, or a message carrying only tool calls.
@@ -105,4 +118,29 @@ func normalizeChatContentPart(part map[string]any) map[string]any {
 	}
 	repaired[dto.ContentTypeImageURL] = map[string]any{"url": imageURL}
 	return repaired
+}
+
+// adoptOrphanToolResult turns a tool result that answers no call into an
+// ordinary user message.
+//
+// ChatGPT opens an automation turn with a function_call_output that has no
+// call_id and no preceding function_call: the "call" never happened, the
+// platform injected the event. Chat completions has no such shape - a tool
+// message needs a tool_call_id, and an assistant message with tool_calls has to
+// precede it - so the request is refused, as "Field required" when the id is
+// missing or as a complaint about an unanswered tool call when it is present
+// but unmatched.
+//
+// The output text is the only real input of that turn, so it is carried over
+// verbatim rather than dropped, and nothing is invented: no fabricated call id,
+// no fabricated assistant tool call.
+func adoptOrphanToolResult(message dto.Message, answeredCalls map[string]struct{}, index int) dto.Message {
+	if message.Role != "tool" {
+		return message
+	}
+	if _, answers := answeredCalls[message.ToolCallId]; answers && message.ToolCallId != "" {
+		return message
+	}
+	kitutil.LogError(fmt.Sprintf("responses to chat conversion turned an unmatched tool result into a user message at messages[%d] (tool_call_id %q)", index, message.ToolCallId))
+	return dto.Message{Role: "user", Content: message.Content}
 }
