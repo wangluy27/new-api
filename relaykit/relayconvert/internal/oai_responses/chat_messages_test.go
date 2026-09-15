@@ -9,8 +9,88 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestChatMessagesFromResponsesRequestCarriesReasoningBack(t *testing.T) {
+	// A thinking-mode upstream refuses the request when the reasoning it
+	// produced does not come back:
+	//   The `reasoning_content` in the thinking mode must be passed back.
+	// The text arrives in one of two places, so both have to reach the
+	// assistant turn the reasoning belongs to.
+	tests := []struct {
+		name      string
+		reasoning map[string]any
+		want      string
+	}{
+		{
+			name: "content parts, as a native Responses upstream sends them",
+			reasoning: map[string]any{
+				"type":    "reasoning",
+				"id":      "rs_1",
+				"content": []map[string]any{{"type": "reasoning_text", "text": "weighing the options"}},
+			},
+			want: "weighing the options",
+		},
+		{
+			name: "summary only, as this gateway produces from reasoning_content",
+			reasoning: map[string]any{
+				"type":    "reasoning",
+				"id":      "chatcmpl-abc_reasoning_0",
+				"summary": []map[string]any{{"type": "summary_text", "text": "weighing the options"}},
+			},
+			want: "weighing the options",
+		},
+		{
+			name: "content wins when the item carries both",
+			reasoning: map[string]any{
+				"type":    "reasoning",
+				"content": []map[string]any{{"type": "reasoning_text", "text": "the full chain"}},
+				"summary": []map[string]any{{"type": "summary_text", "text": "the summary"}},
+			},
+			want: "the full chain",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+				Model: "glm-5.3-flash",
+				Input: mustRawMessage(t, []map[string]any{
+					{"role": "user", "content": "compute 6*7"},
+					tt.reasoning,
+					{"type": "function_call", "call_id": "call_1", "name": "js", "arguments": "{}"},
+				}),
+			})
+			require.NoError(t, err)
+
+			// The reasoning stand-in is gone; its text rides on the assistant turn.
+			require.Len(t, got, 2)
+			assert.Equal(t, "user", got[0].Role)
+			assert.Equal(t, "assistant", got[1].Role)
+			require.NotNil(t, got[1].ReasoningContent)
+			assert.Equal(t, tt.want, *got[1].ReasoningContent)
+			require.Len(t, got[1].ParseToolCalls(), 1)
+		})
+	}
+
+	t.Run("reasoning does not leak onto a later unrelated assistant turn", func(t *testing.T) {
+		got, err := ChatMessagesFromResponsesRequest(&dto.OpenAIResponsesRequest{
+			Model: "glm-5.3-flash",
+			Input: mustRawMessage(t, []map[string]any{
+				{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": "stale"}}},
+				{"role": "user", "content": "a new question"},
+				{"type": "function_call", "call_id": "call_1", "name": "js", "arguments": "{}"},
+			}),
+		})
+		require.NoError(t, err)
+
+		require.Len(t, got, 2)
+		assert.Equal(t, "user", got[0].Role)
+		assert.Equal(t, "assistant", got[1].Role)
+		assert.Nil(t, got[1].ReasoningContent)
+	})
+}
+
 func TestChatMessagesFromResponsesRequest(t *testing.T) {
-	t.Run("a replayed reasoning item does not reach the upstream", func(t *testing.T) {
+	t.Run("a reasoning item with no assistant turn to attach to is dropped", func(t *testing.T) {
 		// Codex asks for reasoning.encrypted_content and replays the reasoning
 		// item on the next turn. It has no role, so it converts into a user
 		// message whose parts the upstream rejects outright:

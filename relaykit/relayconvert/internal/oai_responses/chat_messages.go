@@ -8,6 +8,15 @@ import (
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
 
+const (
+	responsesInputTypeReasoning = "reasoning"
+	// The two shapes a replayed reasoning item can carry its text in: the
+	// upstream's own items use content parts, while the ones this gateway
+	// produces from a chat completions reasoning_content carry only a summary.
+	responsesReasoningTextPart = "reasoning_text"
+	responsesSummaryTextPart   = "summary_text"
+)
+
 // chatContentPartTypes are the content part types chat completions understands.
 // Anything else is a Responses-only shape that the upstream will reject.
 var chatContentPartTypes = map[string]struct{}{
@@ -19,23 +28,29 @@ var chatContentPartTypes = map[string]struct{}{
 }
 
 // ChatMessagesFromResponsesRequest converts the Responses input into chat
-// completions messages and removes what chat completions cannot express.
+// completions messages and reshapes what chat completions cannot express.
 //
-// A Responses "reasoning" item carries the model's own prior thinking as
-// content parts of type reasoning_text, and it has no role, so it converts into
-// a user message full of parts the upstream rejects outright:
+// Three Responses-only shapes are handled here, each of which the upstream
+// refuses outright:
 //
-//	messages[4]: unknown variant `reasoning_text`, expected one of `text`,
-//	`image_url`, `file`
-//
-// Reasoning is provider-internal and cannot be replayed to a different provider
-// in any case, so those parts are dropped, and a message left with nothing else
-// is dropped with them rather than sent empty.
+//   - A reasoning item, which has no role and would convert into a user message
+//     full of parts no chat upstream knows. Its text is moved onto the assistant
+//     turn it belongs to, as reasoning_content, because a thinking-mode upstream
+//     requires the reasoning it produced to come back.
+//   - A tool result answering no call, which ChatGPT injects to open an
+//     automation turn.
+//   - Content parts outside the set chat completions understands, and an
+//     image_url given as a bare string.
 func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Message, error) {
 	messages, err := responsesRequestMessagesToChat(req)
 	if err != nil {
 		return nil, err
 	}
+
+	// Read from the request rather than the converted messages: the items this
+	// gateway produces carry their text in summary, and the request converter
+	// only ever looks at content, so by this point the text would be gone.
+	reasoningTexts := responsesReasoningTexts(req)
 
 	// A tool result is only valid next to the call it answers. Collecting the
 	// ids first lets the loop below tell a real result from one the client
@@ -50,47 +65,146 @@ func ChatMessagesFromResponsesRequest(req *dto.OpenAIResponsesRequest) ([]dto.Me
 	}
 
 	kept := make([]dto.Message, 0, len(messages))
+	pendingReasoning := ""
 	for i, message := range messages {
+		// The converted stand-in for a reasoning item carries nothing worth
+		// sending; its text belongs to the assistant turn that follows.
+		if len(reasoningTexts) > 0 && isReasoningPlaceholder(message) {
+			pendingReasoning = reasoningTexts[0]
+			reasoningTexts = reasoningTexts[1:]
+			continue
+		}
+
 		message = adoptOrphanToolResult(message, answeredCalls, i)
-		parts, ok := message.Content.([]any)
-		if !ok {
-			// A string content, or a message carrying only tool calls.
-			kept = append(kept, message)
-			continue
+
+		if parts, isParts := message.Content.([]any); isParts {
+			supported := make([]any, 0, len(parts))
+			for j, rawPart := range parts {
+				part, isObject := rawPart.(map[string]any)
+				if !isObject {
+					supported = append(supported, rawPart)
+					continue
+				}
+				partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
+				if _, ok := chatContentPartTypes[partType]; ok {
+					supported = append(supported, normalizeChatContentPart(part))
+					continue
+				}
+				kitutil.LogError(fmt.Sprintf("responses to chat conversion dropped unsupported content part type %q at messages[%d].content[%d]", partType, i, j))
+			}
+			// Tool calls are carried outside content, so a message can
+			// legitimately end up with no parts left and still be worth
+			// sending. null rather than an empty array: that is the shape an
+			// assistant message with only tool calls has always been sent
+			// with, and an upstream that accepts a string or null rejects [].
+			if len(supported) == 0 {
+				if len(message.ToolCalls) == 0 {
+					continue
+				}
+				message.Content = nil
+			} else {
+				message.Content = supported
+			}
 		}
 
-		supported := make([]any, 0, len(parts))
-		for j, rawPart := range parts {
-			part, isObject := rawPart.(map[string]any)
-			if !isObject {
-				supported = append(supported, rawPart)
-				continue
+		if message.Role == "assistant" {
+			if pendingReasoning != "" && message.ReasoningContent == nil {
+				reasoning := pendingReasoning
+				message.ReasoningContent = &reasoning
 			}
-			partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
-			if _, ok := chatContentPartTypes[partType]; ok {
-				supported = append(supported, normalizeChatContentPart(part))
-				continue
-			}
-			kitutil.LogError(fmt.Sprintf("responses to chat conversion dropped unsupported content part type %q at messages[%d].content[%d]", partType, i, j))
+			pendingReasoning = ""
+		} else {
+			// Reasoning belongs to the turn that directly follows it. Anything
+			// else in between means the turn it described never made it here.
+			pendingReasoning = ""
 		}
 
-		// Tool calls are carried outside content, so a message can legitimately
-		// end up with no parts left and still be worth sending.
-		if len(supported) == 0 {
-			if len(message.ToolCalls) == 0 {
-				continue
-			}
-			// null, not an empty array: an assistant message that only carries
-			// tool calls has always been sent with a null content, and an
-			// upstream that accepts a string or null there rejects [].
-			message.Content = nil
-			kept = append(kept, message)
-			continue
-		}
-		message.Content = supported
 		kept = append(kept, message)
 	}
 	return kept, nil
+}
+
+// responsesReasoningTexts returns the text of every reasoning item in the
+// request, in order.
+//
+// A thinking-mode upstream requires the reasoning it produced to be passed back
+// and refuses the request otherwise:
+//
+//	The `reasoning_content` in the thinking mode must be passed back to the API.
+//
+// The text lives in one of two places. An upstream that speaks Responses
+// natively fills content with reasoning_text parts; an item this gateway built
+// from a chat completions reasoning_content carries only a summary, because that
+// is all the response converter has to work with.
+func responsesReasoningTexts(req *dto.OpenAIResponsesRequest) []string {
+	if req == nil || !rawJSONPresent(req.Input) || kitutil.GetJsonType(req.Input) != "array" {
+		return nil
+	}
+	var items []map[string]any
+	if err := kitutil.Unmarshal(req.Input, &items); err != nil {
+		return nil
+	}
+
+	texts := make([]string, 0)
+	for _, item := range items {
+		if strings.TrimSpace(kitutil.Interface2String(item["type"])) != responsesInputTypeReasoning {
+			continue
+		}
+		text := reasoningPartsText(item["content"], responsesReasoningTextPart)
+		if text == "" {
+			text = reasoningPartsText(item["summary"], responsesSummaryTextPart)
+		}
+		texts = append(texts, text)
+	}
+	return texts
+}
+
+func reasoningPartsText(raw any, partType string) string {
+	parts, isList := raw.([]any)
+	if !isList {
+		return ""
+	}
+	var text strings.Builder
+	for _, rawPart := range parts {
+		part, isObject := rawPart.(map[string]any)
+		if !isObject {
+			continue
+		}
+		if strings.TrimSpace(kitutil.Interface2String(part["type"])) != partType {
+			continue
+		}
+		text.WriteString(kitutil.Interface2String(part["text"]))
+	}
+	return text.String()
+}
+
+// isReasoningPlaceholder reports whether a converted message is all that is
+// left of a reasoning item. Such an item has no role, so it becomes a user
+// message holding either nothing at all (a summary-only item, whose summary the
+// request converter never reads) or reasoning_text parts.
+func isReasoningPlaceholder(message dto.Message) bool {
+	if message.Role != "user" || len(message.ToolCalls) > 0 {
+		return false
+	}
+	switch content := message.Content.(type) {
+	case string:
+		return strings.TrimSpace(content) == ""
+	case []any:
+		if len(content) == 0 {
+			return false
+		}
+		for _, rawPart := range content {
+			part, isObject := rawPart.(map[string]any)
+			if !isObject {
+				return false
+			}
+			if strings.TrimSpace(kitutil.Interface2String(part["type"])) != responsesReasoningTextPart {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // normalizeChatContentPart repairs part shapes that Responses allows and chat
