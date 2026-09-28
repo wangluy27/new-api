@@ -1,6 +1,7 @@
 package oairesponses
 
 import (
+	"context"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -151,7 +152,7 @@ func TestQualifyResponsesFunctionCallName(t *testing.T) {
 }
 
 func TestResponsesRequestToChatCompletionsRequestReQualifiesReplayedCall(t *testing.T) {
-	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+	got, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
 		Model: "deepseek-v4-flash",
 		Input: mustRawMessage(t, []map[string]any{
 			{"role": "user", "content": "hi"},
