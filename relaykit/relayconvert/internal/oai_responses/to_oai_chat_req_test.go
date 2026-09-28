@@ -242,11 +242,16 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolCallPreservesRawShape
 				"name":    "apply_patch",
 				"input":   "patch body",
 			},
+			{
+				"type":    "custom_tool_call_output",
+				"call_id": "call_custom",
+				"output":  "patch applied",
+			},
 		}),
 	})
 	require.NoError(t, err)
 
-	require.Len(t, got.Messages, 1)
+	require.Len(t, got.Messages, 2)
 	toolCalls := got.Messages[0].ParseToolCalls()
 	require.Len(t, toolCalls, 1)
 	assert.Equal(t, dto.CustomType, toolCalls[0].Type)
@@ -255,6 +260,12 @@ func TestResponsesRequestToChatCompletionsRequestCustomToolCallPreservesRawShape
 	assert.Equal(t, "patch body", toolCalls[0].Function.Arguments)
 	assert.Equal(t, "custom_tool_call", gjson.GetBytes(toolCalls[0].Custom, "type").String())
 	assert.Equal(t, "patch body", gjson.GetBytes(toolCalls[0].Custom, "input").String())
+
+	// The answer has to become the tool message the call expects; anything else
+	// leaves the upstream with a tool call nothing answers.
+	assert.Equal(t, "tool", got.Messages[1].Role)
+	assert.Equal(t, "call_custom", got.Messages[1].ToolCallId)
+	assert.Equal(t, "patch applied", got.Messages[1].Content)
 }
 
 func TestResponsesRequestToChatCompletionsRequestRejectsStatefulFields(t *testing.T) {
