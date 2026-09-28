@@ -191,7 +191,12 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 			return nil, err
 		}
 		return appendToolCallToLastAssistant(messages, toolCall), nil
-	case responsesInputTypeFunctionCallOutput:
+	// A custom tool answers in its own item type, but chat completions has one
+	// tool message shape for both. Leaving it out made the output fall through
+	// to the default branch, which reads "content" - a field this item does not
+	// have - and produced an empty user message: the answer text was lost and
+	// the call it belonged to reached the upstream unanswered.
+	case responsesInputTypeFunctionCallOutput, responsesInputTypeCustomToolOutput:
 		callID := strings.TrimSpace(kitutil.Interface2String(item["call_id"]))
 		content := responseToolOutputToChatContent(item["output"])
 		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), nil
